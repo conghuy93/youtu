@@ -1,0 +1,41 @@
+# Dependencies
+node_modules
+npm-debug.log
+
+# Cache
+cache/*
+!cache/.gitkeep
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs
+
+# Test files
+test_*.js
+test_*.sh
+*.test.js
+
+# Documentation (optional - uncomment to include)
+# *.md
+
+# Scripts
+*.sh
+*.bat
+
+# Misc
+resp.json
+*-player-script.js

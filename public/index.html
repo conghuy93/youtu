@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube MP3 API Tester</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 28px;
+    }
+    section {
+      margin-bottom: 32px;
+      background: #1e293b;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 10px 25px rgba(15, 23, 42, 0.5);
+    }
+    label {
+      font-weight: 600;
+      display: block;
+      margin-bottom: 6px;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid #475569;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-size: 16px;
+    }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 999px;
+      padding: 10px 18px;
+      margin: 6px 6px 6px 0;
+      font-size: 14px;
+      font-weight: 600;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    button.primary {
+      background: linear-gradient(135deg, #06b6d4, #3b82f6);
+      color: white;
+      box-shadow: 0 10px 20px rgba(59, 130, 246, 0.35);
+    }
+    button.secondary {
+      background: #334155;
+      color: #e2e8f0;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.35);
+    }
+    .results {
+      display: grid;
+      gap: 16px;
+      margin-top: 20px;
+    }
+    .result-card {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .result-header {
+      display: flex;
+      gap: 16px;
+    }
+    .thumbnail {
+      width: 160px;
+      height: 90px;
+      border-radius: 8px;
+      object-fit: cover;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .result-info h3 {
+      margin: 0 0 6px;
+      font-size: 18px;
+    }
+    .meta {
+      font-size: 14px;
+      color: #94a3b8;
+    }
+    audio {
+      width: 100%;
+      margin-top: 12px;
+    }
+    .now-playing {
+      font-size: 15px;
+      margin-top: 12px;
+      color: #fbbf24;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .chip {
+      background: #0f172a;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    a.link {
+      color: #38bdf8;
+      text-decoration: none;
+    }
+    .link:hover {
+      text-decoration: underline;
+    }
+    .status {
+      margin-top: 12px;
+      font-size: 13px;
+      color: #38bdf8;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎵 YouTube MP3 API Tester</h1>
+  <p>Trang test nhanh cho API tại <code>/api/search</code> và <code>/api/stream/mp3</code>. Bạn có thể tìm bài hát, chọn video và test các chế độ phát (direct URL, proxy, stream).</p>
+
+  <section>
+    <label for="search-input">Tìm bài hát hoặc nghệ sĩ</label>
+    <form id="search-form">
+      <input id="search-input" type="text" placeholder="Ví dụ: Lạc Trôi, Rick Astley..." required />
+      <div style="margin-top:12px;">
+        <button class="primary" type="submit">🔍 Tìm kiếm</button>
+        <button class="secondary" type="button" id="clear-results">Xóa kết quả</button>
+      </div>
+    </form>
+    <div class="status" id="search-status"></div>
+    <div class="results" id="results"></div>
+  </section>
+
+  <section>
+    <h2>🎧 Trình phát</h2>
+    <audio id="audio-player" controls preload="none"></audio>
+    <div class="now-playing" id="now-playing">Chưa phát bài nào</div>
+    <div class="chips">
+      <span class="chip">Proxy: <code>/api/stream/mp3?id=...&format=proxy</code></span>
+      <span class="chip">Stream: <code>/api/stream/mp3?id=...&format=stream</code></span>
+      <span class="chip">Direct URL: <code>/api/stream/mp3?id=...</code></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>⚙️ Quick Test</h2>
+    <p>Copy/paste URL vào terminal:</p>
+    <pre style="white-space: pre-wrap; background:#0f172a; padding:16px; border-radius:12px; border:1px solid rgba(255,255,255,0.05);">
+# Direct URL (mặc định)
+curl "<span class="code-host"></span>/api/stream/mp3?id=dQw4w9WgXcQ"
+
+# Proxy (tránh CORS/expire)
+curl "<span class="code-host"></span>/api/stream/mp3?id=dQw4w9WgXcQ&format=proxy" -o test.webm
+
+# Stream trực tiếp
+curl "<span class="code-host"></span>/api/stream/mp3?id=dQw4w9WgXcQ&format=stream" -o test.mp3
+    </pre>
+  </section>
+
+  <script>
+    const apiBase = window.location.origin;
+    const searchForm = document.getElementById('search-form');
+    const searchInput = document.getElementById('search-input');
+    const resultsEl = document.getElementById('results');
+    const statusEl = document.getElementById('search-status');
+    const audioPlayer = document.getElementById('audio-player');
+    const nowPlayingEl = document.getElementById('now-playing');
+    const clearBtn = document.getElementById('clear-results');
+
+    document.querySelectorAll('.code-host').forEach(el => {
+      el.textContent = apiBase;
+    });
+
+    clearBtn.addEventListener('click', () => {
+      resultsEl.innerHTML = '';
+      statusEl.textContent = 'Đã xóa kết quả.';
+    });
+
+    searchForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const query = searchInput.value.trim();
+      if (!query) return;
+
+      statusEl.textContent = 'Đang tìm...';
+      resultsEl.innerHTML = '';
+
+      try {
+        const resp = await fetch(`${apiBase}/api/search?q=${encodeURIComponent(query)}&limit=10`);
+        const data = await resp.json();
+
+        if (!data.success) {
+          statusEl.textContent = `Lỗi: ${data.error || 'Không thể tìm kiếm'}`;
+          return;
+        }
+
+        if (!data.data || data.data.length === 0) {
+          statusEl.textContent = 'Không tìm thấy kết quả nào.';
+          return;
+        }
+
+        statusEl.textContent = `Tìm thấy ${data.data.length} kết quả.`;
+        renderResults(data.data);
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = `Lỗi khi tìm kiếm: ${error.message}`;
+      }
+    });
+
+    function renderResults(videos) {
+      resultsEl.innerHTML = '';
+
+      videos.forEach(video => {
+        const card = document.createElement('div');
+        card.className = 'result-card';
+
+        card.innerHTML = `
+          <div class="result-header">
+            <img class="thumbnail" src="${video.thumbnail || ''}" alt="${video.title}" />
+            <div class="result-info">
+              <h3>${video.title}</h3>
+              <div class="meta">Nghệ sĩ: ${video.channel?.name || video.artist || 'Unknown'}</div>
+              <div class="meta">Thời lượng: ${video.duration || 'N/A'} | Views: ${formatNumber(video.views)}</div>
+              <div class="meta">Video ID: <code>${video.id}</code></div>
+            </div>
+          </div>
+          <div>
+            <button class="primary" data-action="play-proxy" data-id="${video.id}" data-title="${video.title}" data-artist="${video.channel?.name || video.artist || 'Unknown'}">▶ Phát (Proxy)</button>
+            <button class="secondary" data-action="play-stream" data-id="${video.id}" data-title="${video.title}" data-artist="${video.channel?.name || video.artist || 'Unknown'}">▶ Phát (Stream)</button>
+            <button class="secondary" data-action="direct-url" data-id="${video.id}">🔗 Direct URL</button>
+            <a class="link" href="https://www.youtube.com/watch?v=${video.id}" target="_blank" rel="noopener">Mở YouTube ↗</a>
+          </div>
+        `;
+
+        card.addEventListener('click', (event) => handleCardClick(event, video));
+        resultsEl.appendChild(card);
+      });
+    }
+
+    function handleCardClick(event, video) {
+      const action = event.target.dataset.action;
+      if (!action) return;
+
+      const videoId = event.target.dataset.id;
+      const title = event.target.dataset.title;
+      const artist = event.target.dataset.artist;
+
+      switch (action) {
+        case 'play-proxy':
+          playAudio(videoId, 'proxy', title, artist);
+          break;
+        case 'play-stream':
+          playAudio(videoId, 'stream', title, artist);
+          break;
+        case 'direct-url':
+          showDirectUrl(videoId);
+          break;
+      }
+    }
+
+    function playAudio(videoId, mode = 'proxy', title = '', artist = '') {
+      const src = mode === 'proxy'
+        ? `${apiBase}/api/stream/mp3?id=${videoId}&format=proxy`
+        : mode === 'stream'
+        ? `${apiBase}/api/stream/mp3?id=${videoId}&format=stream`
+        : `${apiBase}/api/stream/mp3?id=${videoId}`;
+
+      audioPlayer.src = src;
+      audioPlayer.play().catch(console.error);
+      nowPlayingEl.textContent = `Đang phát: ${title} — ${artist} (${mode})`;
+    }
+
+    async function showDirectUrl(videoId) {
+      nowPlayingEl.textContent = 'Đang lấy direct URL...';
+      try {
+        const resp = await fetch(`${apiBase}/api/stream/mp3?id=${videoId}`);
+        const data = await resp.json();
+        if (!data.success) {
+          nowPlayingEl.textContent = `Không lấy được direct URL: ${data.error}`;
+          return;
+        }
+        nowPlayingEl.innerHTML = `Direct URL (có thể hết hạn): <a class="link" href="${data.audio_url}" target="_blank" rel="noopener">Mở trong tab mới</a>`;
+      } catch (error) {
+        nowPlayingEl.textContent = `Lỗi: ${error.message}`;
+      }
+    }
+
+    function formatNumber(value) {
+      if (!value) return '0';
+      return Number(value).toLocaleString('vi-VN');
+    }
+  </script>
+</body>
+</html>
+
+
+
+
+
