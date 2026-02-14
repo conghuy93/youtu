@@ -23,11 +23,11 @@ try {
 }
 
 try {
-    console.log('3. Testing ytdl-core...');
-    require('ytdl-core');
-    console.log('   ✅ ytdl-core OK');
+    console.log('3. Testing @distube/ytdl-core...');
+    require('@distube/ytdl-core');
+    console.log('   ✅ @distube/ytdl-core OK');
 } catch (error) {
-    console.log('   ❌ ytdl-core ERROR:', error.message);
+    console.log('   ❌ @distube/ytdl-core ERROR:', error.message);
     process.exit(1);
 }
 
