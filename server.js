@@ -563,16 +563,193 @@ app.get('/stream_pcm', async (req, res) => {
     }
 });
 
-// Get lyrics/captions from YouTube video - convert to LRC format for ESP32
-// Supports: ?id=VIDEO_ID or ?url=YOUTUBE_URL or ?song=SONG_NAME&artist=ARTIST
-// Get lyrics/captions from YouTube video - convert to LRC format for ESP32
-// Uses yt-dlp for reliable subtitle download
+// ============================================================
+// LRCLIB.net - Free synced lyrics database
+// Provides high-quality, human-transcribed synced lyrics
+// ============================================================
+async function fetchLrclibLyrics(songTitle, artistName, durationSec) {
+    return new Promise((resolve, reject) => {
+        // Build search URL
+        let searchUrl;
+        if (songTitle && artistName) {
+            const params = new URLSearchParams({
+                track_name: songTitle,
+                artist_name: artistName
+            });
+            if (durationSec && durationSec > 0) {
+                params.set('duration', durationSec.toString());
+            }
+            searchUrl = `https://lrclib.net/api/get?${params.toString()}`;
+        } else {
+            // search mode
+            const q = artistName ? `${songTitle} ${artistName}` : songTitle;
+            searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`;
+        }
+        
+        console.log(`[LRCLIB] Fetching: ${searchUrl}`);
+        
+        https.get(searchUrl, {
+            headers: {
+                'User-Agent': 'ESP32MusicServer/1.0 (https://github.com/conghuy93/youtu)',
+                'Accept': 'application/json'
+            },
+            timeout: 8000
+        }, (response) => {
+            if (response.statusCode !== 200) {
+                response.resume();
+                return reject(new Error(`LRCLIB HTTP ${response.statusCode}`));
+            }
+            let data = '';
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    
+                    // Direct match response (single object)
+                    if (json && !Array.isArray(json)) {
+                        if (json.syncedLyrics) {
+                            console.log(`[LRCLIB] Got synced lyrics: ${json.trackName} - ${json.artistName} (${json.syncedLyrics.split('\n').length} lines)`);
+                            return resolve({ lrc: json.syncedLyrics, source: 'lrclib-synced', artist: json.artistName, title: json.trackName });
+                        }
+                        if (json.plainLyrics) {
+                            console.log(`[LRCLIB] Got plain lyrics only: ${json.trackName} - ${json.artistName}`);
+                            return resolve({ plain: json.plainLyrics, source: 'lrclib-plain', artist: json.artistName, title: json.trackName });
+                        }
+                    }
+                    
+                    // Search results (array)
+                    if (Array.isArray(json) && json.length > 0) {
+                        // Prefer results with synced lyrics
+                        const synced = json.find(r => r.syncedLyrics);
+                        if (synced) {
+                            console.log(`[LRCLIB] Search found synced: ${synced.trackName} - ${synced.artistName} (${synced.syncedLyrics.split('\n').length} lines)`);
+                            return resolve({ lrc: synced.syncedLyrics, source: 'lrclib-synced', artist: synced.artistName, title: synced.trackName });
+                        }
+                        const plain = json.find(r => r.plainLyrics);
+                        if (plain) {
+                            console.log(`[LRCLIB] Search found plain: ${plain.trackName} - ${plain.artistName}`);
+                            return resolve({ plain: plain.plainLyrics, source: 'lrclib-plain', artist: plain.artistName, title: plain.trackName });
+                        }
+                    }
+                    
+                    reject(new Error('No lyrics found on LRCLIB'));
+                } catch (e) {
+                    reject(new Error(`LRCLIB parse error: ${e.message}`));
+                }
+            });
+            response.on('error', reject);
+        }).on('error', reject).on('timeout', () => reject(new Error('LRCLIB timeout')));
+    });
+}
+
+// Try LRCLIB search with fallback queries (exact match -> search)
+async function tryLrclibLyrics(songTitle, artistName, durationSec) {
+    // Clean artist name (remove "Music", "Official", "VEVO", etc.)
+    const cleanArtist = (artistName || '')
+        .replace(/\s*(Music|Official|VEVO|Records|Entertainment|Channel|Topic)\s*$/gi, '')
+        .trim();
+    
+    // Step 1: Try exact match with /api/get (with cleaned artist)
+    if (songTitle && cleanArtist) {
+        try {
+            return await fetchLrclibLyrics(songTitle, cleanArtist, durationSec);
+        } catch (e) {
+            console.log(`[LRCLIB] Exact match failed: ${e.message}`);
+        }
+    }
+    
+    // Step 2: Try /api/search?q= with song + artist (broad search)
+    try {
+        const query = cleanArtist ? `${songTitle} ${cleanArtist}` : songTitle;
+        return await fetchLrclibSearch(query);
+    } catch (e) {
+        console.log(`[LRCLIB] Search failed: ${e.message}`);
+    }
+    
+    // Step 3: Try search with just song title
+    if (cleanArtist) {
+        try {
+            return await fetchLrclibSearch(songTitle);
+        } catch (e) {
+            console.log(`[LRCLIB] Title-only search failed: ${e.message}`);
+        }
+    }
+    
+    // Step 4: Try with cleaned title (remove "Official MV", "Lyric Video", etc.)
+    const cleanTitle = songTitle
+        .replace(/\s*[\|\-]\s*(Official|OFFICIAL|MV|M\/V|Music Video|Lyric Video|Audio|HD|4K|Lyrics?|LYRICS?|Visualizer|Live|LIVE|Official MV|OFFICIAL MV).*$/gi, '')
+        .replace(/\s*\([^)]*(?:Official|MV|Lyric|Audio|Live|Remix)[^)]*\)/gi, '')
+        .replace(/\s*\[[^\]]*(?:Official|MV|Lyric|Audio|Live|Remix)[^\]]*\]/gi, '')
+        .trim();
+    
+    if (cleanTitle !== songTitle && cleanTitle.length > 0) {
+        console.log(`[LRCLIB] Retrying with cleaned title: "${cleanTitle}"`);
+        try {
+            return await fetchLrclibSearch(cleanTitle);
+        } catch (e) {
+            console.log(`[LRCLIB] Cleaned search also failed: ${e.message}`);
+        }
+    }
+    
+    return null;
+}
+
+// LRCLIB search endpoint (/api/search?q=...)
+async function fetchLrclibSearch(query) {
+    return new Promise((resolve, reject) => {
+        const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`;
+        console.log(`[LRCLIB] Search: ${searchUrl}`);
+        
+        https.get(searchUrl, {
+            headers: {
+                'User-Agent': 'ESP32MusicServer/1.0 (https://github.com/conghuy93/youtu)',
+                'Accept': 'application/json'
+            },
+            timeout: 8000
+        }, (response) => {
+            if (response.statusCode !== 200) {
+                response.resume();
+                return reject(new Error(`LRCLIB search HTTP ${response.statusCode}`));
+            }
+            let data = '';
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => {
+                try {
+                    const results = JSON.parse(data);
+                    if (!Array.isArray(results) || results.length === 0) {
+                        return reject(new Error('No search results'));
+                    }
+                    // Prefer synced lyrics
+                    const synced = results.find(r => r.syncedLyrics);
+                    if (synced) {
+                        console.log(`[LRCLIB] Search found synced: ${synced.trackName} - ${synced.artistName} (${synced.syncedLyrics.split('\n').length} lines)`);
+                        return resolve({ lrc: synced.syncedLyrics, source: 'lrclib-synced', artist: synced.artistName, title: synced.trackName });
+                    }
+                    const plain = results.find(r => r.plainLyrics);
+                    if (plain) {
+                        console.log(`[LRCLIB] Search found plain: ${plain.trackName} - ${plain.artistName}`);
+                        return resolve({ plain: plain.plainLyrics, source: 'lrclib-plain', artist: plain.artistName, title: plain.trackName });
+                    }
+                    reject(new Error('No lyrics in search results'));
+                } catch (e) {
+                    reject(new Error(`Parse error: ${e.message}`));
+                }
+            });
+            response.on('error', reject);
+        }).on('error', reject).on('timeout', () => reject(new Error('timeout')));
+    });
+}
+
+// Get lyrics - Priority: LRCLIB (accurate) -> YouTube subtitles (fallback)
 // Supports: ?id=VIDEO_ID or ?url=YOUTUBE_URL or ?song=SONG_NAME&artist=ARTIST
 app.get('/api/lyric', async (req, res) => {
     const { url, id, song, artist, format: fmt } = req.query;
     
     try {
         let videoId = null;
+        let songTitle = song || '';
+        let artistName = artist || '';
+        let durationSec = 0;
         
         // Method 1: Direct video ID or URL
         if (id) {
@@ -595,99 +772,170 @@ app.get('/api/lyric', async (req, res) => {
             
             if (results && results.length > 0) {
                 videoId = results[0].id;
+                if (!songTitle) songTitle = results[0].title || '';
+                if (!artistName) artistName = results[0].channel?.name || '';
+                durationSec = results[0].duration ? Math.floor(results[0].duration / 1000) : 0;
                 console.log(`[YouTube API] Lyric search: "${query}" -> ${results[0].title} (${videoId})`);
             }
         }
         
-        if (!videoId) {
-            recordError();
-            return res.status(400).json({
-                success: false,
-                error: 'Missing parameter: url, id, or song'
-            });
-        }
-        
-        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        
-        // Use yt-dlp to download subtitles (most reliable method)
-        // Prefer: vi > en > any auto-generated caption
-        const subLangs = 'vi,en';
-        const tmpDir = path.join(os.tmpdir(), 'yt-subs');
-        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-        const tmpFile = path.join(tmpDir, videoId);
-        
-        // Clean up old files
-        for (const ext of ['.vi.srt', '.en.srt', '.srt']) {
-            const f = tmpFile + ext;
-            if (fs.existsSync(f)) fs.unlinkSync(f);
-        }
-        
-        console.log(`[YouTube API] Downloading subtitles for ${videoId} via yt-dlp...`);
-        
-        let srtContent = '';
-        let usedLang = '';
-        
-        // Try manual subtitles first, then auto-generated
-        for (const subFlag of ['--write-sub', '--write-auto-sub']) {
-            if (srtContent) break;
-            
+        // If we have video ID but no title/artist, try to get info
+        if (videoId && !songTitle) {
             try {
-                await new Promise((resolve, reject) => {
-                    const args = [
-                        subFlag,
-                        '--sub-lang', subLangs,
-                        '--sub-format', 'srt',
-                        '--skip-download',
-                        '--no-warnings',
-                        '-o', tmpFile,
-                        videoUrl
-                    ];
-                    execFile(YTDLP_PATH, args, { timeout: 20000 }, (err, stdout, stderr) => {
-                        if (err && !fs.existsSync(tmpFile + '.vi.srt') && !fs.existsSync(tmpFile + '.en.srt')) {
-                            return reject(err);
-                        }
-                        resolve();
-                    });
-                });
+                const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
+                songTitle = info.videoDetails?.title || '';
+                artistName = info.videoDetails?.author?.name || '';
+                durationSec = parseInt(info.videoDetails?.lengthSeconds || '0');
             } catch (e) {
-                console.log(`[YouTube API] yt-dlp ${subFlag} failed: ${e.message}`);
-                continue;
-            }
-            
-            // Read subtitle file (prefer vi > en)
-            for (const lang of ['vi', 'en']) {
-                const srtFile = `${tmpFile}.${lang}.srt`;
-                if (fs.existsSync(srtFile)) {
-                    srtContent = fs.readFileSync(srtFile, 'utf-8');
-                    usedLang = lang;
-                    console.log(`[YouTube API] Got ${lang} subtitles: ${srtContent.length} chars (${subFlag})`);
-                    fs.unlinkSync(srtFile); // cleanup
-                    break;
-                }
+                console.log(`[YouTube API] Could not get video info for title extraction: ${e.message}`);
             }
         }
         
-        if (!srtContent) {
-            console.log(`[YouTube API] No subtitles found for ${videoId}`);
-            // Cleanup any stray files
-            for (const ext of ['.vi.srt', '.en.srt']) {
+        // Extract clean title/artist from YouTube title format
+        // Common patterns: "Artist - Song Title [Official MV]", "SONG | ARTIST | OFFICIAL MV"
+        if (songTitle && !artist) {
+            // Remove common suffixes first
+            let cleanedTitle = songTitle
+                .replace(/\s*[\[\(]?\s*(?:Official\s*(?:Video|MV|M\/V|Music\s*Video|Audio|Lyric\s*Video)?|OFFICIAL\s*(?:VIDEO|MV|MUSIC\s*VIDEO)?|MV|M\/V|Lyric\s*Video|Audio|HD|4K|Visualizer|Vietsub|Lyrics?|LYRICS?|Live|LIVE)\s*[\]\)]?\s*/gi, ' ')
+                .replace(/\s*[\[\(][^\]\)]*(?:Soundtrack|OST|Remix|Cover|Karaoke|Instrumental)[^\]\)]*[\]\)]\s*/gi, ' ')
+                .replace(/\s*ft\.?\s*/gi, ' ft. ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            
+            // Try "Part1 - Part2" or "Part1 | Part2" split
+            const sepMatch = cleanedTitle.match(/^(.+?)\s*[\|\-–—]\s*(.+)$/);
+            if (sepMatch) {
+                const part1 = sepMatch[1].trim();
+                const part2 = sepMatch[2].trim()
+                    .replace(/\s*[\|\-–—]\s*$/g, '') // trailing separators
+                    .replace(/\s*ft\.?\s+.*$/i, '') // remove ft. from end for clean search
+                    .trim();
+                
+                // Heuristic: if we already have an artistName from YouTube channel,
+                // check which part matches the channel name
+                if (artistName) {
+                    const artistLower = artistName.toLowerCase();
+                    const p1Lower = part1.toLowerCase();
+                    const p2Lower = part2.toLowerCase();
+                    
+                    if (p1Lower.includes(artistLower) || artistLower.includes(p1Lower)) {
+                        // Part1 is artist, Part2 is song
+                        songTitle = part2;
+                    } else if (p2Lower.includes(artistLower) || artistLower.includes(p2Lower)) {
+                        // Part2 is artist, Part1 is song
+                        songTitle = part1;
+                    } else {
+                        // Can't determine - assume "Artist - Song" (most common)
+                        songTitle = part2;
+                        artistName = part1;
+                    }
+                } else {
+                    // No artist info - assume "Artist - Song" format
+                    artistName = part1;
+                    songTitle = part2;
+                }
+            } else {
+                songTitle = cleanedTitle;
+            }
+            
+            // Final cleanup: remove "ft. XYZ" from songTitle for cleaner LRCLIB search
+            songTitle = songTitle.replace(/\s*ft\.?\s+.*$/i, '').trim();
+        }
+        
+        console.log(`[Lyrics] Looking up: title="${songTitle}" artist="${artistName}" duration=${durationSec}s`);
+        
+        // ===== PRIORITY 1: Try LRCLIB (accurate, human-transcribed lyrics) =====
+        let lrcText = '';
+        let lrcSource = '';
+        
+        const lrcResult = await tryLrclibLyrics(songTitle, artistName, durationSec);
+        if (lrcResult) {
+            if (lrcResult.lrc) {
+                lrcText = lrcResult.lrc;
+                lrcSource = lrcResult.source;
+                console.log(`[Lyrics] Using LRCLIB synced lyrics (${lrcText.split('\n').length} lines)`);
+            } else if (lrcResult.plain) {
+                // Plain lyrics - add dummy timestamps so ESP32 can display them
+                const lines = lrcResult.plain.split('\n').filter(l => l.trim());
+                lrcText = lines.map((line, i) => {
+                    const min = Math.floor(i * 5 / 60);
+                    const sec = (i * 5) % 60;
+                    return `[${min.toString().padStart(2, '0')}:${sec.toFixed(2).padStart(5, '0')}]${line}`;
+                }).join('\n');
+                lrcSource = lrcResult.source;
+                console.log(`[Lyrics] Using LRCLIB plain lyrics with generated timestamps (${lines.length} lines)`);
+            }
+        }
+        
+        // ===== PRIORITY 2: Fall back to YouTube auto-captions via yt-dlp =====
+        if (!lrcText && videoId) {
+            console.log(`[Lyrics] LRCLIB miss, trying YouTube subtitles for ${videoId}...`);
+            
+            const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+            const subLangs = 'vi,en';
+            const tmpDir = path.join(os.tmpdir(), 'yt-subs');
+            if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+            const tmpFile = path.join(tmpDir, videoId);
+            
+            // Clean up old files
+            for (const ext of ['.vi.srt', '.en.srt', '.srt']) {
                 const f = tmpFile + ext;
                 if (fs.existsSync(f)) fs.unlinkSync(f);
             }
-            return res.status(404).json({
-                success: false,
-                error: 'No captions/lyrics available for this video'
-            });
+            
+            let srtContent = '';
+            let usedLang = '';
+            
+            for (const subFlag of ['--write-sub', '--write-auto-sub']) {
+                if (srtContent) break;
+                try {
+                    await new Promise((resolve, reject) => {
+                        const args = [
+                            subFlag, '--sub-lang', subLangs, '--sub-format', 'srt',
+                            '--skip-download', '--no-warnings', '-o', tmpFile, videoUrl
+                        ];
+                        execFile(YTDLP_PATH, args, { timeout: 20000 }, (err, stdout, stderr) => {
+                            if (err && !fs.existsSync(tmpFile + '.vi.srt') && !fs.existsSync(tmpFile + '.en.srt')) {
+                                return reject(err);
+                            }
+                            resolve();
+                        });
+                    });
+                } catch (e) {
+                    console.log(`[Lyrics] yt-dlp ${subFlag} failed: ${e.message}`);
+                    continue;
+                }
+                
+                for (const lang of ['vi', 'en']) {
+                    const srtFile = `${tmpFile}.${lang}.srt`;
+                    if (fs.existsSync(srtFile)) {
+                        srtContent = fs.readFileSync(srtFile, 'utf-8');
+                        usedLang = lang;
+                        console.log(`[Lyrics] Got ${lang} subtitles: ${srtContent.length} chars (${subFlag})`);
+                        fs.unlinkSync(srtFile);
+                        break;
+                    }
+                }
+            }
+            
+            if (srtContent) {
+                lrcText = convertSRTtoLRC(srtContent);
+                lrcSource = `youtube-${usedLang}`;
+            }
+            
+            // Cleanup
+            for (const ext of ['.vi.srt', '.en.srt']) {
+                const f = tmpFile + ext;
+                if (fs.existsSync(f)) try { fs.unlinkSync(f); } catch(e) {}
+            }
         }
         
-        // Convert SRT to LRC
-        const lrcText = convertSRTtoLRC(srtContent);
-        
+        // No lyrics from any source
         if (!lrcText) {
-            return res.status(404).json({
-                success: false,
-                error: 'Failed to parse subtitles'
-            });
+            if (!videoId && !song) {
+                return res.status(400).json({ success: false, error: 'Missing parameter: url, id, or song' });
+            }
+            return res.status(404).json({ success: false, error: 'No lyrics available from any source' });
         }
         
         // Return based on format
@@ -698,21 +946,18 @@ app.get('/api/lyric', async (req, res) => {
             res.json({
                 success: true,
                 id: videoId,
-                language: usedLang,
+                source: lrcSource,
                 lyrics: lrcText,
                 lrc: lrcText
             });
         }
         
-        console.log(`[YouTube API] Returned LRC lyrics for ${videoId} (${usedLang}, ${lrcText.split('\n').length} lines)`);
+        console.log(`[Lyrics] Returned ${lrcSource} lyrics for "${songTitle}" (${lrcText.split('\n').length} lines)`);
         
     } catch (error) {
         recordError();
-        console.error('[YouTube API] Lyric error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('[Lyrics] Error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
