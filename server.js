@@ -98,6 +98,177 @@ if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
+// ============================================================
+// MP3 CACHE SYSTEM
+// Cache 20 bài nghe nhiều nhất dưới dạng MP3 sẵn
+// Lần sau phát lại → trả file ngay, không cần YouTube + ffmpeg
+// ============================================================
+const MP3_CACHE_DIR = path.join(__dirname, 'mp3_cache');
+const MP3_CACHE_META_FILE = path.join(MP3_CACHE_DIR, 'cache_meta.json');
+const MP3_CACHE_MAX = 20; // Tối đa 20 bài cached
+
+if (!fs.existsSync(MP3_CACHE_DIR)) {
+    fs.mkdirSync(MP3_CACHE_DIR, { recursive: true });
+}
+
+// Cache metadata: { videoId: { title, artist, playCount, lastPlayed, fileSize, cachedAt } }
+let mp3CacheMeta = {};
+try {
+    if (fs.existsSync(MP3_CACHE_META_FILE)) {
+        mp3CacheMeta = JSON.parse(fs.readFileSync(MP3_CACHE_META_FILE, 'utf-8'));
+        console.log(`[MP3 Cache] Loaded ${Object.keys(mp3CacheMeta).length} cached songs`);
+    }
+} catch (e) {
+    console.log(`[MP3 Cache] No existing cache metadata`);
+    mp3CacheMeta = {};
+}
+
+function saveCacheMeta() {
+    try {
+        fs.writeFileSync(MP3_CACHE_META_FILE, JSON.stringify(mp3CacheMeta, null, 2));
+    } catch (e) {
+        console.error(`[MP3 Cache] Failed to save metadata: ${e.message}`);
+    }
+}
+
+function getCachedMp3Path(videoId) {
+    return path.join(MP3_CACHE_DIR, `${videoId}.mp3`);
+}
+
+function isCached(videoId) {
+    const mp3Path = getCachedMp3Path(videoId);
+    return fs.existsSync(mp3Path) && mp3CacheMeta[videoId];
+}
+
+// Evict least-played songs when cache is full
+function evictCacheIfNeeded() {
+    const ids = Object.keys(mp3CacheMeta);
+    if (ids.length < MP3_CACHE_MAX) return;
+    
+    // Sort by playCount ascending, then lastPlayed ascending (evict least used)
+    ids.sort((a, b) => {
+        const diff = (mp3CacheMeta[a].playCount || 0) - (mp3CacheMeta[b].playCount || 0);
+        if (diff !== 0) return diff;
+        return (mp3CacheMeta[a].lastPlayed || 0) - (mp3CacheMeta[b].lastPlayed || 0);
+    });
+    
+    // Remove least used until under limit
+    while (Object.keys(mp3CacheMeta).length >= MP3_CACHE_MAX) {
+        const evictId = ids.shift();
+        if (!evictId) break;
+        const evictPath = getCachedMp3Path(evictId);
+        try { fs.unlinkSync(evictPath); } catch(e) {}
+        console.log(`[MP3 Cache] Evicted: ${mp3CacheMeta[evictId]?.title || evictId} (plays: ${mp3CacheMeta[evictId]?.playCount || 0})`);
+        delete mp3CacheMeta[evictId];
+    }
+    saveCacheMeta();
+}
+
+// Cache MP3 in background (download + convert + save, không block response)
+async function cacheMp3InBackground(videoId, title, artist) {
+    if (isCached(videoId)) return; // Already cached
+    
+    try {
+        const directUrl = await getYtDlpDirectUrl(videoId);
+        const mp3Path = getCachedMp3Path(videoId);
+        const tmpPath = mp3Path + '.tmp';
+        
+        console.log(`[MP3 Cache] Caching: "${title}" (${videoId})...`);
+        
+        await new Promise((resolve, reject) => {
+            const ffArgs = [
+                '-nostdin', '-loglevel', 'error',
+                '-i', directUrl,
+                '-vn', '-acodec', 'libmp3lame',
+                '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                '-f', 'mp3', tmpPath
+            ];
+            
+            const proc = spawn(FFMPEG_PATH, ffArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+            proc.on('close', (code) => {
+                if (code === 0 && fs.existsSync(tmpPath)) {
+                    fs.renameSync(tmpPath, mp3Path);
+                    resolve();
+                } else {
+                    try { fs.unlinkSync(tmpPath); } catch(e) {}
+                    reject(new Error(`ffmpeg exit code ${code}`));
+                }
+            });
+            proc.on('error', reject);
+            
+            // Timeout 120s
+            setTimeout(() => {
+                if (!proc.killed) proc.kill();
+                reject(new Error('Cache conversion timeout'));
+            }, 120000);
+        });
+        
+        const stats = fs.statSync(mp3Path);
+        
+        evictCacheIfNeeded();
+        
+        mp3CacheMeta[videoId] = {
+            title: title || 'Unknown',
+            artist: artist || 'Unknown',
+            playCount: mp3CacheMeta[videoId]?.playCount || 1,
+            lastPlayed: Date.now(),
+            fileSize: stats.size,
+            cachedAt: Date.now()
+        };
+        saveCacheMeta();
+        
+        console.log(`[MP3 Cache] ✓ Cached: "${title}" (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+    } catch (e) {
+        console.log(`[MP3 Cache] Failed to cache ${videoId}: ${e.message}`);
+    }
+}
+
+// Serve cached MP3 file
+function serveCachedMp3(videoId, req, res) {
+    const mp3Path = getCachedMp3Path(videoId);
+    const stats = fs.statSync(mp3Path);
+    const meta = mp3CacheMeta[videoId];
+    
+    // Update play stats
+    if (meta) {
+        meta.playCount = (meta.playCount || 0) + 1;
+        meta.lastPlayed = Date.now();
+        saveCacheMeta();
+    }
+    
+    console.log(`[MP3 Cache] ⚡ Serving cached: "${meta?.title}" (play #${meta?.playCount}, ${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+    
+    // Support Range requests for seeking
+    const range = req.headers.range;
+    if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : stats.size - 1;
+        const chunkSize = end - start + 1;
+        
+        res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${stats.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunkSize,
+            'Content-Type': 'audio/mpeg',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400',
+            'X-Cache': 'HIT'
+        });
+        fs.createReadStream(mp3Path, { start, end }).pipe(res);
+    } else {
+        res.writeHead(200, {
+            'Content-Length': stats.size,
+            'Content-Type': 'audio/mpeg',
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400',
+            'X-Cache': 'HIT'
+        });
+        fs.createReadStream(mp3Path).pipe(res);
+    }
+}
+
 // Helper: Extract video ID from YouTube URL
 function extractVideoId(url) {
     const patterns = [
@@ -345,6 +516,14 @@ app.get('/api/stream/mp3', async (req, res) => {
         // ĐƠN GIẢN NHẤT: Chỉ lấy direct URL và proxy stream (không cần metadata, không convert)
         let directUrl;
         const startTime = Date.now();
+        
+        // ===== CHECK MP3 CACHE FIRST =====
+        if (format === 'mp3' && isCached(videoId)) {
+            console.log(`[YouTube API] ⚡ Cache HIT for ${videoId}`);
+            serveCachedMp3(videoId, req, res);
+            return;
+        }
+        
         try {
             console.log(`[YouTube API] Starting to get direct URL for ${videoId}...`);
             directUrl = await getYtDlpDirectUrl(videoId);
@@ -386,6 +565,20 @@ app.get('/api/stream/mp3', async (req, res) => {
             try {
                 await streamMp3FromDirectUrl(directUrl, videoId, req, res, bitrateK);
                 console.log(`[YouTube API] Streaming MP3 (${bitrateK}kbps) for ${videoId} via directUrl`);
+                
+                // Cache in background for next time (không block response)
+                if (!isCached(videoId)) {
+                    // Record play and schedule background cache
+                    if (!mp3CacheMeta[videoId]) {
+                        mp3CacheMeta[videoId] = { playCount: 0 };
+                    }
+                    mp3CacheMeta[videoId].playCount = (mp3CacheMeta[videoId].playCount || 0) + 1;
+                    mp3CacheMeta[videoId].lastPlayed = Date.now();
+                    saveCacheMeta();
+                    
+                    // Auto-cache after first play
+                    cacheMp3InBackground(videoId, '', '').catch(() => {});
+                }
             } catch (mp3Error) {
                 recordError();
                 console.error(`[YouTube API] MP3 conversion failed:`, mp3Error.message);
@@ -549,6 +742,19 @@ app.get('/stream_pcm', async (req, res) => {
         
         // Log response
         console.log(`[YouTube API] Stream PCM response: ${response.title} - ${response.artist} (${videoId})`);
+        
+        // Pre-cache MP3 in background khi ESP32 request bài hát
+        if (!isCached(videoId)) {
+            cacheMp3InBackground(videoId, response.title, response.artist).catch(() => {});
+        } else {
+            // Update play stats
+            if (mp3CacheMeta[videoId]) {
+                mp3CacheMeta[videoId].playCount = (mp3CacheMeta[videoId].playCount || 0) + 1;
+                mp3CacheMeta[videoId].lastPlayed = Date.now();
+                saveCacheMeta();
+            }
+            console.log(`[MP3 Cache] ⚡ "${response.title}" already cached (play #${mp3CacheMeta[videoId]?.playCount})`);
+        }
         
         // Return JSON response (không stream trực tiếp)
         res.json(response);
@@ -1437,6 +1643,51 @@ function formatDuration(seconds) {
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
 }
 
+// ===== MP3 Cache Management API =====
+app.get('/api/cache', (req, res) => {
+    const entries = Object.entries(mp3CacheMeta)
+        .map(([id, meta]) => ({
+            id,
+            title: meta.title,
+            artist: meta.artist,
+            playCount: meta.playCount || 0,
+            lastPlayed: meta.lastPlayed ? new Date(meta.lastPlayed).toISOString() : null,
+            fileSize: meta.fileSize ? `${(meta.fileSize / 1024 / 1024).toFixed(1)}MB` : 'converting...',
+            cached: isCached(id)
+        }))
+        .sort((a, b) => b.playCount - a.playCount);
+    
+    const totalSize = Object.values(mp3CacheMeta)
+        .reduce((sum, m) => sum + (m.fileSize || 0), 0);
+    
+    res.json({
+        maxCached: MP3_CACHE_MAX,
+        totalCached: entries.filter(e => e.cached).length,
+        totalSizeMB: (totalSize / 1024 / 1024).toFixed(1),
+        songs: entries
+    });
+});
+
+// Delete specific cached song
+app.delete('/api/cache/:id', (req, res) => {
+    const videoId = req.params.id;
+    const mp3Path = getCachedMp3Path(videoId);
+    try { fs.unlinkSync(mp3Path); } catch(e) {}
+    delete mp3CacheMeta[videoId];
+    saveCacheMeta();
+    res.json({ success: true, message: `Deleted cache for ${videoId}` });
+});
+
+// Clear all cache
+app.delete('/api/cache', (req, res) => {
+    for (const id of Object.keys(mp3CacheMeta)) {
+        try { fs.unlinkSync(getCachedMp3Path(id)); } catch(e) {}
+    }
+    mp3CacheMeta = {};
+    saveCacheMeta();
+    res.json({ success: true, message: 'All cache cleared' });
+});
+
 // 404 handler
 app.use((req, res) => {
     res.status(404).json({
@@ -1452,6 +1703,9 @@ app.use((req, res) => {
             'GET /api/stream/mp3?url=... or ?id=...',
             'GET /api/lyric?id=...&format=lrc or ?song=...&artist=...',
             'GET /api/search?q=...',
+            'GET /api/cache - View cached MP3s',
+            'DELETE /api/cache/:id - Remove cached song',
+            'DELETE /api/cache - Clear all cache',
             'GET /stats'
         ]
     });
