@@ -1,4 +1,4 @@
-# API Reference
+curl https://api.minizip.com/health# API Reference
 
 ## Base URL
 ```

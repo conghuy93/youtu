@@ -8,3 +8,10 @@ logs/
 *.mp4
 .pm2
 
+# Temp player script files
+*-player-script.js
+
+# Server output and response files
+server_output.log
+resp.json
+

@@ -520,13 +520,17 @@ app.get('/stream_pcm', async (req, res) => {
         
         // Check if video has captions (lyrics)
         let hasLyrics = false;
-        if (videoInfo && videoInfo.captions && videoInfo.captions.length > 0) {
-            hasLyrics = true;
+        if (videoInfo) {
+            const captionTracks = videoInfo?.player_response?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            if (captionTracks && captionTracks.length > 0) {
+                hasLyrics = true;
+            }
         }
         
         // Build response tương tự ZingMP3 proxy structure
         // Tương thích 100% với ESP32/AI parsing (theo ESP32_RESPONSE_FIELDS.md)
         // audio_url/url: dùng luồng MP3 (convert bằng ffmpeg) để dễ tương thích thiết bị/ứng dụng
+        // lyric_url: luôn trả để ESP32 thử fetch (server sẽ tự tìm captions)
         const response = {
             success: true,
             id: videoId,
@@ -536,7 +540,7 @@ app.get('/stream_pcm', async (req, res) => {
             // Client sẽ gọi: GET /api/stream/mp3?id=VIDEO_ID&format=mp3
             audio_url: `/api/stream/mp3?id=${videoId}&format=mp3`,
             url: `/api/stream/mp3?id=${videoId}&format=mp3`,
-            lyric_url: hasLyrics ? `/api/lyric?id=${videoId}` : null, // Lyrics endpoint (null nếu không có)
+            lyric_url: `/api/lyric?id=${videoId}&format=lrc`, // Luôn trả lyric_url, endpoint sẽ tự xử lý
             thumbnail: firstVideo.thumbnail?.url || (videoInfo?.videoDetails?.thumbnails?.[videoInfo.videoDetails.thumbnails.length - 1]?.url) || '',
             duration: videoInfo ? parseInt(videoInfo.videoDetails.lengthSeconds) : (firstVideo.duration || 0),
             bitrate: '128kbps', // AAC/Opus bitrate (tùy format được chọn)
@@ -559,61 +563,149 @@ app.get('/stream_pcm', async (req, res) => {
     }
 });
 
-// Get lyrics/captions from YouTube video
+// Get lyrics/captions from YouTube video - convert to LRC format for ESP32
+// Supports: ?id=VIDEO_ID or ?url=YOUTUBE_URL or ?song=SONG_NAME&artist=ARTIST
+// Get lyrics/captions from YouTube video - convert to LRC format for ESP32
+// Uses yt-dlp for reliable subtitle download
+// Supports: ?id=VIDEO_ID or ?url=YOUTUBE_URL or ?song=SONG_NAME&artist=ARTIST
 app.get('/api/lyric', async (req, res) => {
-    const { url, id } = req.query;
-    
-    if (!url && !id) {
-        recordError();
-        return res.status(400).json({
-            success: false,
-            error: 'Missing parameter: url or id'
-        });
-    }
+    const { url, id, song, artist, format: fmt } = req.query;
     
     try {
-        const videoId = id || extractVideoId(url);
+        let videoId = null;
+        
+        // Method 1: Direct video ID or URL
+        if (id) {
+            videoId = id;
+        } else if (url) {
+            videoId = extractVideoId(url);
+        } else if (song) {
+            // Method 2: Search by song name (for ESP32 fallback)
+            let query = song;
+            if (artist) query = `${song} ${artist}`;
+            
+            let results;
+            if (typeof search === 'function') {
+                results = await search(query, { limit: 3, type: 'video' });
+            } else if (youtubeSr.default && typeof youtubeSr.default.search === 'function') {
+                results = await youtubeSr.default.search(query, { limit: 3, type: 'video' });
+            } else if (typeof youtubeSr.search === 'function') {
+                results = await youtubeSr.search(query, { limit: 3, type: 'video' });
+            }
+            
+            if (results && results.length > 0) {
+                videoId = results[0].id;
+                console.log(`[YouTube API] Lyric search: "${query}" -> ${results[0].title} (${videoId})`);
+            }
+        }
         
         if (!videoId) {
             recordError();
             return res.status(400).json({
                 success: false,
-                error: 'Invalid YouTube URL or ID'
+                error: 'Missing parameter: url, id, or song'
             });
         }
         
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
         
-        // Get video info với captions
-        const info = await ytdl.getInfo(videoUrl);
+        // Use yt-dlp to download subtitles (most reliable method)
+        // Prefer: vi > en > any auto-generated caption
+        const subLangs = 'vi,en';
+        const tmpDir = path.join(os.tmpdir(), 'yt-subs');
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+        const tmpFile = path.join(tmpDir, videoId);
         
-        // Tìm captions/subtitles (có thể dùng làm lyrics)
-        let lyrics = null;
-        let lyricsUrl = null;
-        
-        if (info.captions && info.captions.length > 0) {
-            // Lấy caption đầu tiên (thường là auto-generated hoặc manual)
-            const caption = info.captions[0];
-            lyricsUrl = caption.baseUrl;
-            
-            // Có thể fetch caption content nếu cần
-            // Note: Caption format thường là XML (TTML) hoặc JSON
+        // Clean up old files
+        for (const ext of ['.vi.srt', '.en.srt', '.srt']) {
+            const f = tmpFile + ext;
+            if (fs.existsSync(f)) fs.unlinkSync(f);
         }
         
-        res.json({
-            success: true,
-            data: {
-                id: videoId,
-                hasLyrics: !!lyricsUrl,
-                lyricsUrl: lyricsUrl,
-                lyrics: lyrics, // Nếu đã fetch được
-                captionLanguages: info.captions?.map(c => ({
-                    languageCode: c.languageCode,
-                    languageName: c.name,
-                    baseUrl: c.baseUrl
-                })) || []
+        console.log(`[YouTube API] Downloading subtitles for ${videoId} via yt-dlp...`);
+        
+        let srtContent = '';
+        let usedLang = '';
+        
+        // Try manual subtitles first, then auto-generated
+        for (const subFlag of ['--write-sub', '--write-auto-sub']) {
+            if (srtContent) break;
+            
+            try {
+                await new Promise((resolve, reject) => {
+                    const args = [
+                        subFlag,
+                        '--sub-lang', subLangs,
+                        '--sub-format', 'srt',
+                        '--skip-download',
+                        '--no-warnings',
+                        '-o', tmpFile,
+                        videoUrl
+                    ];
+                    execFile(YTDLP_PATH, args, { timeout: 20000 }, (err, stdout, stderr) => {
+                        if (err && !fs.existsSync(tmpFile + '.vi.srt') && !fs.existsSync(tmpFile + '.en.srt')) {
+                            return reject(err);
+                        }
+                        resolve();
+                    });
+                });
+            } catch (e) {
+                console.log(`[YouTube API] yt-dlp ${subFlag} failed: ${e.message}`);
+                continue;
             }
-        });
+            
+            // Read subtitle file (prefer vi > en)
+            for (const lang of ['vi', 'en']) {
+                const srtFile = `${tmpFile}.${lang}.srt`;
+                if (fs.existsSync(srtFile)) {
+                    srtContent = fs.readFileSync(srtFile, 'utf-8');
+                    usedLang = lang;
+                    console.log(`[YouTube API] Got ${lang} subtitles: ${srtContent.length} chars (${subFlag})`);
+                    fs.unlinkSync(srtFile); // cleanup
+                    break;
+                }
+            }
+        }
+        
+        if (!srtContent) {
+            console.log(`[YouTube API] No subtitles found for ${videoId}`);
+            // Cleanup any stray files
+            for (const ext of ['.vi.srt', '.en.srt']) {
+                const f = tmpFile + ext;
+                if (fs.existsSync(f)) fs.unlinkSync(f);
+            }
+            return res.status(404).json({
+                success: false,
+                error: 'No captions/lyrics available for this video'
+            });
+        }
+        
+        // Convert SRT to LRC
+        const lrcText = convertSRTtoLRC(srtContent);
+        
+        if (!lrcText) {
+            return res.status(404).json({
+                success: false,
+                error: 'Failed to parse subtitles'
+            });
+        }
+        
+        // Return based on format
+        if (fmt === 'lrc' || fmt === 'text') {
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.send(lrcText);
+        } else {
+            res.json({
+                success: true,
+                id: videoId,
+                language: usedLang,
+                lyrics: lrcText,
+                lrc: lrcText
+            });
+        }
+        
+        console.log(`[YouTube API] Returned LRC lyrics for ${videoId} (${usedLang}, ${lrcText.split('\n').length} lines)`);
+        
     } catch (error) {
         recordError();
         console.error('[YouTube API] Lyric error:', error.message);
@@ -623,6 +715,177 @@ app.get('/api/lyric', async (req, res) => {
         });
     }
 });
+
+// Convert SRT subtitle format to LRC format
+function convertSRTtoLRC(srtContent) {
+    const lines = [];
+    // SRT format: sequence number, timestamp line, text, blank line
+    // Timestamp: 00:00:00,320 --> 00:00:14,040
+    const blocks = srtContent.split(/\n\s*\n/);
+    
+    for (const block of blocks) {
+        const blockLines = block.trim().split('\n');
+        if (blockLines.length < 2) continue;
+        
+        // Find timestamp line (contains -->)
+        let timeLineIdx = -1;
+        for (let i = 0; i < blockLines.length; i++) {
+            if (blockLines[i].includes('-->')) {
+                timeLineIdx = i;
+                break;
+            }
+        }
+        if (timeLineIdx === -1) continue;
+        
+        // Parse start time: HH:MM:SS,mmm or HH:MM:SS.mmm
+        const timeMatch = blockLines[timeLineIdx].match(/(\d+):(\d+):(\d+)[,.]?(\d*)/);
+        if (!timeMatch) continue;
+        
+        const hours = parseInt(timeMatch[1]);
+        const minutes = parseInt(timeMatch[2]);
+        const seconds = parseInt(timeMatch[3]);
+        const ms = parseInt((timeMatch[4] || '0').padEnd(3, '0'));
+        
+        const totalMinutes = hours * 60 + minutes;
+        const totalSec = seconds + ms / 1000;
+        
+        // Get text (everything after timestamp line)
+        const text = blockLines.slice(timeLineIdx + 1).join(' ')
+            .replace(/<[^>]+>/g, '') // Remove HTML tags
+            .replace(/\[.*?\]/g, '') // Remove [Music] etc.  
+            .trim();
+        
+        if (!text) continue;
+        
+        const secStr = totalSec.toFixed(2);
+        lines.push(`[${totalMinutes.toString().padStart(2, '0')}:${secStr.padStart(5, '0')}]${text}`);
+    }
+    
+    return lines.length > 0 ? lines.join('\n') : null;
+}
+
+// Helper: Fetch URL content (follows redirects, sets User-Agent)
+function fetchUrl(url, maxRedirects = 5) {
+    return new Promise((resolve, reject) => {
+        if (maxRedirects <= 0) {
+            return reject(new Error('Too many redirects'));
+        }
+        const client = url.startsWith('https') ? https : http;
+        const options = {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9,vi;q=0.8',
+            }
+        };
+        client.get(url, options, (response) => {
+            // Follow redirects
+            if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+                const redirectUrl = new URL(response.headers.location, url).toString();
+                console.log(`[YouTube API] Redirect ${response.statusCode}: ${redirectUrl.substring(0, 80)}...`);
+                response.resume();
+                return fetchUrl(redirectUrl, maxRedirects - 1).then(resolve).catch(reject);
+            }
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}`));
+                response.resume();
+                return;
+            }
+            let data = '';
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => resolve(data));
+            response.on('error', reject);
+        }).on('error', reject);
+    });
+}
+
+// Helper: Convert YouTube captions (XML/JSON) to LRC format
+function convertCaptionsToLRC(content) {
+    let lines = [];
+    
+    // Try parsing as JSON (srv3 format) first
+    try {
+        const json = JSON.parse(content);
+        if (json.events) {
+            for (const event of json.events) {
+                if (!event.segs) continue;
+                const text = event.segs.map(s => s.utf8 || '').join('').trim();
+                if (!text || text === '\n') continue;
+                const startMs = event.tStartMs || 0;
+                const minutes = Math.floor(startMs / 60000);
+                const seconds = ((startMs % 60000) / 1000).toFixed(2);
+                lines.push(`[${minutes.toString().padStart(2, '0')}:${seconds.padStart(5, '0')}]${text}`);
+            }
+            console.log(`[YouTube API] Parsed srv3 JSON: ${lines.length} lines`);
+        }
+    } catch (e) {
+        // Not JSON, try XML
+    }
+    
+    // Try parsing as XML (timedtext format) if JSON failed
+    if (lines.length === 0) {
+        // YouTube timedtext XML: <text start="seconds" dur="seconds">content</text>
+        const xmlPattern = /<text\s+start=["']?([\d.]+)["']?\s+dur=["']?([\d.]+)["']?[^>]*>([\s\S]*?)<\/text>/gi;
+        let match;
+        while ((match = xmlPattern.exec(content)) !== null) {
+            const startSec = parseFloat(match[1]);
+            let text = match[3]
+                .replace(/<[^>]+>/g, '') // Remove HTML tags
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/&apos;/g, "'")
+                .replace(/\n/g, ' ')
+                .trim();
+            
+            if (!text) continue;
+            
+            const totalMs = startSec * 1000;
+            const minutes = Math.floor(totalMs / 60000);
+            const seconds = ((totalMs % 60000) / 1000).toFixed(2);
+            lines.push(`[${minutes.toString().padStart(2, '0')}:${seconds.padStart(5, '0')}]${text}`);
+        }
+        console.log(`[YouTube API] Parsed XML timedtext: ${lines.length} lines`);
+    }
+    
+    // Fallback: try TTML format <p begin="HH:MM:SS.mmm" end="...">content</p>
+    if (lines.length === 0) {
+        const ttmlPattern = /<p\s+[^>]*begin=["']?([\d.:]+)["']?[^>]*>([\s\S]*?)<\/p>/gi;
+        let match;
+        while ((match = ttmlPattern.exec(content)) !== null) {
+            const timeStr = match[1];
+            let text = match[2]
+                .replace(/<[^>]+>/g, '')
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/\n/g, ' ')
+                .trim();
+            
+            if (!text) continue;
+            
+            let totalMs = 0;
+            if (timeStr.includes(':')) {
+                const parts = timeStr.split(':');
+                if (parts.length === 3) {
+                    totalMs = (parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2])) * 1000;
+                } else if (parts.length === 2) {
+                    totalMs = (parseInt(parts[0]) * 60 + parseFloat(parts[1])) * 1000;
+                }
+            } else {
+                totalMs = parseFloat(timeStr) * 1000;
+            }
+            
+            const minutes = Math.floor(totalMs / 60000);
+            const seconds = ((totalMs % 60000) / 1000).toFixed(2);
+            lines.push(`[${minutes.toString().padStart(2, '0')}:${seconds.padStart(5, '0')}]${text}`);
+        }
+        console.log(`[YouTube API] Parsed TTML: ${lines.length} lines`);
+    }
+    
+    return lines.length > 0 ? lines.join('\n') : null;
+}
 
 // Search YouTube videos
 app.get('/api/search', async (req, res) => {
@@ -733,6 +996,7 @@ app.use((req, res) => {
             'GET /api/mp3?url=... or ?id=...',
             'GET /api/mp4?url=... or ?id=...',
             'GET /api/stream/mp3?url=... or ?id=...',
+            'GET /api/lyric?id=...&format=lrc or ?song=...&artist=...',
             'GET /api/search?q=...',
             'GET /stats'
         ]

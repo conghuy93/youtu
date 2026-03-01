@@ -80,7 +80,8 @@ cloudflared tunnel login
 Sẽ hiển thị URL, mở trong browser và chọn domain/zone:
 ```
 Please open the following URL and log in with your Cloudflare account:
-https://dash.cloudflare.com/argotunnel?callback=...
+https://dash.cloudflare.com/argotun# 5. Chạy tunnel
+cloudflared tunnel run youtube-apinel?callback=...
 ```
 
 ### Bước 4: Tạo tunnel

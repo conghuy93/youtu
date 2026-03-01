@@ -61,7 +61,7 @@ sudo apt install -y git
 
 ```bash
 cd ~
-git clone <repository-url> youtube_mp3_api
+git clone https://github.com/conghuy93/youtu.git youtube_mp3_api
 cd youtube_mp3_api
 ```
 
