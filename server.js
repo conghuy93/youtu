@@ -782,12 +782,40 @@ app.get('/api/lyric', async (req, res) => {
         // If we have video ID but no title/artist, try to get info
         if (videoId && !songTitle) {
             try {
-                const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
-                songTitle = info.videoDetails?.title || '';
-                artistName = info.videoDetails?.author?.name || '';
-                durationSec = parseInt(info.videoDetails?.lengthSeconds || '0');
+                // Use yt-dlp for reliable title extraction (ytdl-core often fails/blocked)
+                const videoInfo = await new Promise((resolve, reject) => {
+                    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+                    execFile(YTDLP_PATH, ['--dump-json', '--no-warnings', videoUrl], 
+                        { timeout: 15000 }, 
+                        (err, stdout, stderr) => {
+                            if (err) return reject(err);
+                            try {
+                                const json = JSON.parse(stdout);
+                                resolve(json);
+                            } catch (e) {
+                                reject(new Error(`Failed to parse yt-dlp JSON: ${e.message}`));
+                            }
+                        }
+                    );
+                });
+                
+                songTitle = videoInfo.title || '';
+                artistName = videoInfo.uploader || videoInfo.channel || '';
+                durationSec = Math.floor(videoInfo.duration || 0);
+                
+                console.log(`[YouTube API] Extracted from video ${videoId}: "${songTitle}" by "${artistName}" (${durationSec}s)`);
             } catch (e) {
                 console.log(`[YouTube API] Could not get video info for title extraction: ${e.message}`);
+                // Fallback: try ytdl-core as last resort
+                try {
+                    const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
+                    songTitle = info.videoDetails?.title || '';
+                    artistName = info.videoDetails?.author?.name || '';
+                    durationSec = parseInt(info.videoDetails?.lengthSeconds || '0');
+                    console.log(`[YouTube API] Fallback ytdl-core: "${songTitle}" by "${artistName}"`);
+                } catch (e2) {
+                    console.log(`[YouTube API] ytdl-core also failed: ${e2.message}`);
+                }
             }
         }
         
@@ -802,37 +830,62 @@ app.get('/api/lyric', async (req, res) => {
                 .replace(/\s+/g, ' ')
                 .trim();
             
-            // Try "Part1 - Part2" or "Part1 | Part2" split
-            const sepMatch = cleanedTitle.match(/^(.+?)\s*[\|\-–—]\s*(.+)$/);
-            if (sepMatch) {
-                const part1 = sepMatch[1].trim();
-                const part2 = sepMatch[2].trim()
-                    .replace(/\s*[\|\-–—]\s*$/g, '') // trailing separators
-                    .replace(/\s*ft\.?\s+.*$/i, '') // remove ft. from end for clean search
-                    .trim();
-                
-                // Heuristic: if we already have an artistName from YouTube channel,
-                // check which part matches the channel name
-                if (artistName) {
-                    const artistLower = artistName.toLowerCase();
-                    const p1Lower = part1.toLowerCase();
-                    const p2Lower = part2.toLowerCase();
+            // Detect separator and split
+            let separator = null;
+            if (cleanedTitle.includes('|')) {
+                separator = '|';
+            } else if (cleanedTitle.match(/[\-–—]/)) {
+                separator = '-';
+            }
+            
+            if (separator) {
+                const parts = cleanedTitle.split(separator).map(p => p.trim()).filter(p => p);
+                if (parts.length >= 2) {
+                    const part1 = parts[0];
+                    const part2 = parts[1]
+                        .replace(/\s*ft\.?\s+.*$/i, '') // remove ft. from end
+                        .trim();
                     
-                    if (p1Lower.includes(artistLower) || artistLower.includes(p1Lower)) {
-                        // Part1 is artist, Part2 is song
-                        songTitle = part2;
-                    } else if (p2Lower.includes(artistLower) || artistLower.includes(p2Lower)) {
-                        // Part2 is artist, Part1 is song
+                    // For Vietnamese music: "|" separator almost always means "SONG | ARTIST"
+                    if (separator === '|') {
                         songTitle = part1;
+                        artistName = part2;
                     } else {
-                        // Can't determine - assume "Artist - Song" (most common)
-                        songTitle = part2;
-                        artistName = part1;
+                        // For "-" separator: use heuristics
+                        if (artistName) {
+                            // Check for partial or full match with channel name
+                            const artistLower = artistName.toLowerCase();
+                            const p1Lower = part1.toLowerCase();
+                            const p2Lower = part2.toLowerCase();
+                            
+                            // Extract key words from artist name (e.g., "ICM" from "ICM Entertainment")
+                            const artistWords = artistLower.split(/\s+/).filter(w => w.length > 2);
+                            
+                            // Check word-level matches
+                            const p1HasArtist = artistWords.some(w => p1Lower.includes(w));
+                            const p2HasArtist = artistWords.some(w => p2Lower.includes(w));
+                            
+                            if (p1HasArtist && !p2HasArtist) {
+                                // Part1 is artist, Part2 is song
+                                artistName = part1;
+                                songTitle = part2;
+                            } else if (p2HasArtist && !p1HasArtist) {
+                                // Part2 is artist, Part1 is song
+                                songTitle = part1;
+                                artistName = part2;
+                            } else {
+                                // Can't determine - assume "Artist - Song" (most common for "-")
+                                artistName = part1;
+                                songTitle = part2;
+                            }
+                        } else {
+                            // No artist info - assume "Artist - Song" format
+                            artistName = part1;
+                            songTitle = part2;
+                        }
                     }
                 } else {
-                    // No artist info - assume "Artist - Song" format
-                    artistName = part1;
-                    songTitle = part2;
+                    songTitle = cleanedTitle;
                 }
             } else {
                 songTitle = cleanedTitle;
