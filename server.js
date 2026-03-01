@@ -740,7 +740,159 @@ async function fetchLrclibSearch(query) {
     });
 }
 
-// Get lyrics - Priority: LRCLIB (accurate) -> YouTube subtitles (fallback)
+// ============================================================
+// PARALLEL TIMING: Merge LRCLIB text with YouTube timestamps
+// LRCLIB = correct text (human transcribed)
+// YouTube auto-captions = correct timing (synced to actual video)
+// Result = correct text + accurate timing
+// ============================================================
+
+/**
+ * Parse LRC text into array of {time_ms, text}
+ */
+function parseLrcToLines(lrcText) {
+    const lines = [];
+    for (const line of lrcText.split('\n')) {
+        const match = line.match(/^\[(\d+):(\d+(?:\.\d+)?)\](.*)/);
+        if (!match) continue;
+        const minutes = parseInt(match[1]);
+        const seconds = parseFloat(match[2]);
+        const time_ms = minutes * 60000 + Math.round(seconds * 1000);
+        const text = match[3].trim();
+        lines.push({ time_ms, text });
+    }
+    return lines;
+}
+
+/**
+ * Convert array of {time_ms, text} back to LRC text
+ */
+function linesToLrc(lines) {
+    return lines.map(l => {
+        const min = Math.floor(l.time_ms / 60000);
+        const sec = ((l.time_ms % 60000) / 1000).toFixed(2);
+        return `[${min.toString().padStart(2, '0')}:${sec.padStart(5, '0')}]${l.text}`;
+    }).join('\n');
+}
+
+/**
+ * Fetch YouTube auto-captions timestamps for a video
+ * Returns SRT content string (or null)
+ */
+async function fetchYouTubeSubsRaw(videoId) {
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const subLangs = 'vi,en';
+    const tmpDir = path.join(os.tmpdir(), 'yt-subs');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, `timing_${videoId}`);
+    
+    // Clean up old files
+    for (const ext of ['.vi.srt', '.en.srt', '.srt']) {
+        const f = tmpFile + ext;
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
+    
+    let srtContent = '';
+    
+    for (const subFlag of ['--write-sub', '--write-auto-sub']) {
+        if (srtContent) break;
+        try {
+            await new Promise((resolve, reject) => {
+                const args = [
+                    subFlag, '--sub-lang', subLangs, '--sub-format', 'srt',
+                    '--skip-download', '--no-warnings', '-o', tmpFile, videoUrl
+                ];
+                execFile(YTDLP_PATH, args, { timeout: 20000 }, (err) => {
+                    if (err && !fs.existsSync(tmpFile + '.vi.srt') && !fs.existsSync(tmpFile + '.en.srt')) {
+                        return reject(err);
+                    }
+                    resolve();
+                });
+            });
+        } catch (e) {
+            continue;
+        }
+        
+        for (const lang of ['vi', 'en']) {
+            const srtFile = `${tmpFile}.${lang}.srt`;
+            if (fs.existsSync(srtFile)) {
+                srtContent = fs.readFileSync(srtFile, 'utf-8');
+                fs.unlinkSync(srtFile);
+                break;
+            }
+        }
+    }
+    
+    // Cleanup
+    for (const ext of ['.vi.srt', '.en.srt']) {
+        const f = tmpFile + ext;
+        if (fs.existsSync(f)) try { fs.unlinkSync(f); } catch(e) {}
+    }
+    
+    return srtContent || null;
+}
+
+/**
+ * Align LRCLIB lyrics text with YouTube auto-caption timestamps
+ * 
+ * Algorithm:
+ * 1. Parse both into {time_ms, text} arrays
+ * 2. Find first and last singing lines in both
+ * 3. Calculate linear time mapping: t_new = (t_lrc - lrc_start) * scale + yt_start
+ * 4. Apply to all LRCLIB lines → correct text with accurate YouTube timing
+ */
+function alignLyricsWithYouTubeTiming(lrclibLrc, youtubeSrt) {
+    // Parse LRCLIB lines
+    const lrcLines = parseLrcToLines(lrclibLrc);
+    if (lrcLines.length === 0) return lrclibLrc;
+    
+    // Parse YouTube SRT to get timestamps
+    const ytLrc = convertSRTtoLRC(youtubeSrt);
+    if (!ytLrc) return lrclibLrc;
+    const ytLines = parseLrcToLines(ytLrc);
+    if (ytLines.length < 3) return lrclibLrc; // Not enough YouTube data
+    
+    // Find first and last non-empty lines in both
+    const lrcSinging = lrcLines.filter(l => l.text.length > 0);
+    const ytSinging = ytLines.filter(l => l.text.length > 0);
+    
+    if (lrcSinging.length === 0 || ytSinging.length === 0) return lrclibLrc;
+    
+    const lrcFirst = lrcSinging[0].time_ms;
+    const lrcLast = lrcSinging[lrcSinging.length - 1].time_ms;
+    const ytFirst = ytSinging[0].time_ms;
+    const ytLast = ytSinging[ytSinging.length - 1].time_ms;
+    
+    console.log(`[Timing] LRCLIB: ${lrcSinging.length} lines, first=${lrcFirst}ms, last=${lrcLast}ms`);
+    console.log(`[Timing] YouTube: ${ytSinging.length} lines, first=${ytFirst}ms, last=${ytLast}ms`);
+    
+    // Calculate linear mapping: t_new = (t - lrcFirst) * scale + ytFirst
+    const lrcSpan = lrcLast - lrcFirst;
+    const ytSpan = ytLast - ytFirst;
+    
+    let scale = 1.0;
+    if (lrcSpan > 1000 && ytSpan > 1000) {
+        scale = ytSpan / lrcSpan;
+        // Sanity check: scale should be close to 1.0 (0.8 - 1.2)
+        if (scale < 0.7 || scale > 1.5) {
+            console.log(`[Timing] Scale ${scale.toFixed(3)} out of range, using offset-only`);
+            scale = 1.0;
+        }
+    }
+    
+    const offset = ytFirst - lrcFirst * scale;
+    console.log(`[Timing] Alignment: scale=${scale.toFixed(4)}, offset=${offset.toFixed(0)}ms`);
+    
+    // Apply mapping to all LRCLIB lines
+    const alignedLines = lrcLines.map(l => ({
+        time_ms: Math.max(0, Math.round(l.time_ms * scale + offset)),
+        text: l.text
+    }));
+    
+    return linesToLrc(alignedLines);
+}
+
+// Get lyrics - Priority: LRCLIB text + YouTube timing (parallel) -> LRCLIB only -> YouTube only
 // Supports: ?id=VIDEO_ID or ?url=YOUTUBE_URL or ?song=SONG_NAME&artist=ARTIST
 app.get('/api/lyric', async (req, res) => {
     const { url, id, song, artist, format: fmt } = req.query;
@@ -897,89 +1049,93 @@ app.get('/api/lyric', async (req, res) => {
         
         console.log(`[Lyrics] Looking up: title="${songTitle}" artist="${artistName}" duration=${durationSec}s`);
         
-        // ===== PRIORITY 1: Try LRCLIB (accurate, human-transcribed lyrics) =====
+        // ===== PARALLEL FETCH: LRCLIB (text) + YouTube (timing) simultaneously =====
         let lrcText = '';
         let lrcSource = '';
         
-        const lrcResult = await tryLrclibLyrics(songTitle, artistName, durationSec);
-        if (lrcResult) {
-            if (lrcResult.lrc) {
-                lrcText = lrcResult.lrc;
-                lrcSource = lrcResult.source;
-                console.log(`[Lyrics] Using LRCLIB synced lyrics (${lrcText.split('\n').length} lines)`);
-            } else if (lrcResult.plain) {
-                // Plain lyrics - add dummy timestamps so ESP32 can display them
-                const lines = lrcResult.plain.split('\n').filter(l => l.trim());
-                lrcText = lines.map((line, i) => {
-                    const min = Math.floor(i * 5 / 60);
-                    const sec = (i * 5) % 60;
-                    return `[${min.toString().padStart(2, '0')}:${sec.toFixed(2).padStart(5, '0')}]${line}`;
-                }).join('\n');
-                lrcSource = lrcResult.source;
-                console.log(`[Lyrics] Using LRCLIB plain lyrics with generated timestamps (${lines.length} lines)`);
-            }
-        }
-        
-        // ===== PRIORITY 2: Fall back to YouTube auto-captions via yt-dlp =====
-        if (!lrcText && videoId) {
-            console.log(`[Lyrics] LRCLIB miss, trying YouTube subtitles for ${videoId}...`);
+        if (videoId) {
+            // Run LRCLIB and YouTube subtitle fetching IN PARALLEL
+            console.log(`[Lyrics] Parallel fetch: LRCLIB + YouTube subs for ${videoId}`);
             
-            const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-            const subLangs = 'vi,en';
-            const tmpDir = path.join(os.tmpdir(), 'yt-subs');
-            if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-            const tmpFile = path.join(tmpDir, videoId);
+            const [lrcResult, ytSrt] = await Promise.all([
+                tryLrclibLyrics(songTitle, artistName, durationSec).catch(e => {
+                    console.log(`[Lyrics] LRCLIB failed: ${e.message}`);
+                    return null;
+                }),
+                fetchYouTubeSubsRaw(videoId).catch(e => {
+                    console.log(`[Lyrics] YouTube subs failed: ${e.message}`);
+                    return null;
+                })
+            ]);
             
-            // Clean up old files
-            for (const ext of ['.vi.srt', '.en.srt', '.srt']) {
-                const f = tmpFile + ext;
-                if (fs.existsSync(f)) fs.unlinkSync(f);
-            }
-            
-            let srtContent = '';
-            let usedLang = '';
-            
-            for (const subFlag of ['--write-sub', '--write-auto-sub']) {
-                if (srtContent) break;
-                try {
-                    await new Promise((resolve, reject) => {
-                        const args = [
-                            subFlag, '--sub-lang', subLangs, '--sub-format', 'srt',
-                            '--skip-download', '--no-warnings', '-o', tmpFile, videoUrl
-                        ];
-                        execFile(YTDLP_PATH, args, { timeout: 20000 }, (err, stdout, stderr) => {
-                            if (err && !fs.existsSync(tmpFile + '.vi.srt') && !fs.existsSync(tmpFile + '.en.srt')) {
-                                return reject(err);
-                            }
-                            resolve();
-                        });
-                    });
-                } catch (e) {
-                    console.log(`[Lyrics] yt-dlp ${subFlag} failed: ${e.message}`);
-                    continue;
+            if (lrcResult && lrcResult.lrc) {
+                // LRCLIB has synced lyrics
+                if (ytSrt) {
+                    // BEST CASE: Both available → merge LRCLIB text with YouTube timing
+                    console.log(`[Lyrics] ★ Merging LRCLIB text + YouTube timing (parallel alignment)`);
+                    lrcText = alignLyricsWithYouTubeTiming(lrcResult.lrc, ytSrt);
+                    lrcSource = 'lrclib+youtube-timing';
+                } else {
+                    // YouTube subs not available → use LRCLIB timing as-is
+                    lrcText = lrcResult.lrc;
+                    lrcSource = lrcResult.source;
+                    console.log(`[Lyrics] Using LRCLIB synced lyrics only (no YouTube timing available)`);
                 }
-                
-                for (const lang of ['vi', 'en']) {
-                    const srtFile = `${tmpFile}.${lang}.srt`;
-                    if (fs.existsSync(srtFile)) {
-                        srtContent = fs.readFileSync(srtFile, 'utf-8');
-                        usedLang = lang;
-                        console.log(`[Lyrics] Got ${lang} subtitles: ${srtContent.length} chars (${subFlag})`);
-                        fs.unlinkSync(srtFile);
-                        break;
+            } else if (lrcResult && lrcResult.plain) {
+                // LRCLIB has plain lyrics only → use YouTube timing if available
+                const plainLines = lrcResult.plain.split('\n').filter(l => l.trim());
+                if (ytSrt) {
+                    // Map plain text lines to YouTube timestamps
+                    const ytLrc = convertSRTtoLRC(ytSrt);
+                    const ytLines = ytLrc ? parseLrcToLines(ytLrc) : [];
+                    const ytSinging = ytLines.filter(l => l.text.length > 0);
+                    
+                    if (ytSinging.length > 0) {
+                        // Distribute plain text lines across YouTube timestamps
+                        const merged = [];
+                        const ratio = plainLines.length / ytSinging.length;
+                        for (let i = 0; i < ytSinging.length && i * ratio < plainLines.length; i++) {
+                            const textIdx = Math.min(Math.floor(i * ratio), plainLines.length - 1);
+                            merged.push({ time_ms: ytSinging[i].time_ms, text: plainLines[textIdx] });
+                        }
+                        lrcText = linesToLrc(merged);
+                        lrcSource = 'lrclib-plain+youtube-timing';
+                        console.log(`[Lyrics] Merged ${plainLines.length} plain lines with ${ytSinging.length} YouTube timestamps`);
                     }
                 }
+                
+                if (!lrcText) {
+                    // No YouTube timing → generate dummy timestamps
+                    lrcText = plainLines.map((line, i) => {
+                        const min = Math.floor(i * 5 / 60);
+                        const sec = (i * 5) % 60;
+                        return `[${min.toString().padStart(2, '0')}:${sec.toFixed(2).padStart(5, '0')}]${line}`;
+                    }).join('\n');
+                    lrcSource = lrcResult.source;
+                    console.log(`[Lyrics] Using LRCLIB plain lyrics with generated timestamps`);
+                }
+            } else if (ytSrt) {
+                // NO LRCLIB → fallback to YouTube auto-captions (garbled text but accurate timing)
+                lrcText = convertSRTtoLRC(ytSrt);
+                lrcSource = 'youtube-auto';
+                console.log(`[Lyrics] Fallback: YouTube auto-captions only (no LRCLIB match)`);
             }
-            
-            if (srtContent) {
-                lrcText = convertSRTtoLRC(srtContent);
-                lrcSource = `youtube-${usedLang}`;
-            }
-            
-            // Cleanup
-            for (const ext of ['.vi.srt', '.en.srt']) {
-                const f = tmpFile + ext;
-                if (fs.existsSync(f)) try { fs.unlinkSync(f); } catch(e) {}
+        } else {
+            // No video ID → LRCLIB only (song/artist search)
+            const lrcResult = await tryLrclibLyrics(songTitle, artistName, durationSec);
+            if (lrcResult) {
+                if (lrcResult.lrc) {
+                    lrcText = lrcResult.lrc;
+                    lrcSource = lrcResult.source;
+                } else if (lrcResult.plain) {
+                    const lines = lrcResult.plain.split('\n').filter(l => l.trim());
+                    lrcText = lines.map((line, i) => {
+                        const min = Math.floor(i * 5 / 60);
+                        const sec = (i * 5) % 60;
+                        return `[${min.toString().padStart(2, '0')}:${sec.toFixed(2).padStart(5, '0')}]${line}`;
+                    }).join('\n');
+                    lrcSource = lrcResult.source;
+                }
             }
         }
         
