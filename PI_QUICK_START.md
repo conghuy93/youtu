@@ -365,18 +365,447 @@ pm2 logs music-server | grep "LRCLIB\|Lyrics"
 
 ## Update server
 
+### Kiểm tra updates có sẵn
 ```bash
-# Cập nhật code mới từ GitHub
 cd ~/youtube_music_api
+
+# Check local vs remote status
+git status
+git fetch origin
+git log HEAD..origin/master --oneline
+# Nếu có commits mới, sẽ hiển thị danh sách changes
+```
+
+### Method 1: Auto update từ GitHub
+```bash
+# Về thư mục server
+cd ~/youtube_music_api
+
+# Pull latest changes
 git pull origin master
+
+# Check xem có dependency mới không
+if [ -f package.json ]; then
+    echo "Checking for new dependencies..."
+    npm install
+fi
 
 # Restart PM2 service
 pm2 restart music-server
 
-# Or restart manually
-npm install  # if new packages added
+# Verify server is running
+pm2 status
+```
+
+### Method 2: Update từ chat này (live updates)
+
+#### 2.1 Xem thay đổi từ chat
+Khi có update từ chat, copy code changes vào Pi:
+
+```bash
+# Backup current file trước khi edit
+cd ~/youtube_music_api
+cp server.js server.js.backup
+
+# Edit file với nano
+nano server.js
+# Paste code changes từ chat, save với Ctrl+X, Y, Enter
+```
+
+#### 2.2 Test changes trước khi restart
+```bash
+# Syntax check
+node -c server.js
+# Should return nothing if syntax OK
+
+# Test import packages
+node -e "require('./server.js')" 2>/dev/null || echo "Import test failed"
+```
+
+#### 2.3 Apply changes
+```bash
+# Stop server
+pm2 stop music-server
+
+# Start với test mode để xem live logs
+node server.js
+# Check logs xem có error không, Ctrl+C để stop
+
+# Nếu OK, start lại với PM2
+pm2 start server.js --name music-server
+
+# Monitor logs
+pm2 logs music-server --lines 20
+```
+
+### Method 3: Hot reload (development mode)
+```bash
+# Install nodemon cho auto-restart
+sudo npm install -g nodemon
+
+# Start với nodemon instead of PM2
+pm2 stop music-server  # stop PM2 first
+nodemon server.js
+
+# File sẽ auto-restart khi có changes
+# Useful khi đang test nhiều changes liên tiếp
+```
+
+### Verify update thành công
+```bash
+# Health check
+curl http://localhost:6680/health
+
+# Test new features (example: lyrics LRCLIB)
+curl "http://localhost:6680/api/lyric?song=see+you+again&artist=wiz+khalifa&format=lrc" | head -n 5
+
+# Check from ESP32 (replace IP)
+curl "http://192.168.0.150:6680/health"
+```
+
+### Rollback nếu có vấn đề
+```bash
+# Method 1: Git rollback
+git log --oneline  # Find commit hash to rollback to
+git reset --hard COMMIT_HASH
+pm2 restart music-server
+
+# Method 2: Restore backup
+cp server.js.backup server.js
+pm2 restart music-server
+
+# Method 3: Factory reset
+git reset --hard origin/master
+npm install
 pm2 restart music-server
 ```
+
+### Update dependencies (nếu package.json thay đổi)
+```bash
+# Clear npm cache
+npm cache clean --force
+
+# Reinstall all packages
+rm -rf node_modules package-lock.json
+npm install
+
+# If errors, try with legacy peer deps
+npm install --legacy-peer-deps
+
+# Restart service
+pm2 restart music-server
+```
+
+### Auto-update script (advanced)
+Tạo script tự động check và update:
+
+```bash
+# Create update script
+nano ~/update_music_server.sh
+```
+
+Paste nội dung này:
+```bash
+#!/bin/bash
+cd ~/youtube_music_api
+
+echo "🔍 Checking for updates..."
+git fetch origin
+
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse origin/master)
+
+if [ "$LOCAL" != "$REMOTE" ]; then
+    echo "📥 Updates available! Updating..."
+    
+    # Backup current version
+    cp server.js server.js.backup.$(date +%Y%m%d_%H%M%S)
+    
+    # Pull changes
+    git pull origin master
+    
+    # Update dependencies if needed
+    npm install
+    
+    # Test syntax
+    if node -c server.js; then
+        echo "✅ Syntax OK, restarting server..."
+        pm2 restart music-server
+        sleep 3
+        
+        # Verify health
+        if curl -f http://localhost:6680/health > /dev/null 2>&1; then
+            echo "✅ Server updated successfully!"
+        else
+            echo "❌ Health check failed, rolling back..."
+            cp server.js.backup.* server.js
+            pm2 restart music-server
+        fi
+    else
+        echo "❌ Syntax error, rolling back..."
+        cp server.js.backup.* server.js
+    fi
+else
+    echo "✅ Already up to date!"
+fi
+```
+
+```bash
+# Make executable
+chmod +x ~/update_music_server.sh
+
+# Run update
+~/update_music_server.sh
+
+# Schedule auto-updates (optional)
+crontab -e
+# Add line: 0 */6 * * * /home/pi/update_music_server.sh
+# Runs every 6 hours
+```
+
+### Live debugging khi có issues
+```bash
+# Real-time logs
+pm2 logs music-server --lines 100 -f  # Follow mode
+
+# Check process status
+pm2 monit  # Interactive monitor
+
+# Memory/CPU usage
+htop
+# Press 'F4' để filter 'node'
+
+# Network connections
+sudo netstat -tulpn | grep 6680
+
+# Disk space
+df -h
+
+# Check for errors in system logs
+sudo journalctl -f | grep -i error
+```
+
+### Manual patch từ chat
+Khi được hướng dẫn paste code specific từ chat:
+
+```bash
+# 1. Navigate to location
+cd ~/youtube_music_api
+
+# 2. Edit với nano
+nano server.js
+
+# 3. Find location (Ctrl+W để search)
+# Search cho function name hoặc line number từ instruction
+
+# 4. Copy paste exactly từ chat
+# Use mouse right-click paste or Ctrl+Shift+V
+
+# 5. Save & test
+# Ctrl+X → Y → Enter để save
+node -c server.js  # syntax check
+
+# 6. Restart
+pm2 restart music-server
+```
+
+### Emergency recovery
+```bash
+# Complete reset to working state
+cd ~/youtube_music_api
+git reset --hard origin/master
+git clean -fd  # Remove any untracked files
+npm install
+pm2 restart music-server
+
+# If git is corrupted
+rm -rf ~/.youtube_music_api
+cd ~
+git clone https://github.com/conghuy93/youtu.git youtube_music_api
+cd youtube_music_api
+npm install
+pm2 delete music-server  # Remove old config
+pm2 start server.js --name music-server
+```
+
+**💡 Best Practice**: Luôn test code changes trước, backup files quan trọng, và verify health check sau mỗi update.
+
+---
+
+## Chat-based Development Workflow  
+
+### Workflow khi nhận code changes từ chat
+
+#### 1. Backup current state
+```bash
+cd ~/youtube_music_api
+cp server.js server.js.backup.$(date +%Y%m%d_%H%M%S)
+ls -la server.js.backup.*  # Verify backup created
+```
+
+#### 2. Apply changes từ chat
+```bash
+# Method A: Edit trực tiếp với nano
+nano server.js
+
+# Trong nano:
+# - Ctrl+W: Search cho function/line cần edit
+# - Navigate đến vị trí cần thay đổi
+# - Delete old code, paste new code từ chat
+# - Ctrl+X, Y, Enter để save
+
+# Method B: Use sed cho specific line replacements
+# (khi chat cung cấp specific sed commands)
+```
+
+#### 3. Validate changes
+```bash
+# Check syntax
+node -c server.js
+echo $?  # Should be 0 if OK
+
+# Test imports
+node -e "console.log('✅ Syntax OK')" 2>/dev/null && echo "Ready to restart"
+```
+
+#### 4. Restart với monitoring
+```bash
+# Stop current server
+pm2 stop music-server
+
+# Test run để xem live errors
+timeout 10 node server.js || echo "Test completed"
+
+# If looks good, restart PM2
+pm2 start server.js --name music-server
+
+# Monitor first 30 seconds
+timeout 30 pm2 logs music-server --lines 0 -f
+```
+
+#### 5. Verify functionality  
+```bash
+# Health check
+echo "Testing health check..."
+curl -s http://localhost:6680/health | jq .
+
+# Test specific new feature (example for LRCLIB)
+echo "Testing new lyrics feature..."
+curl -s "http://localhost:6680/api/lyric?song=test&format=lrc" | head -n 3
+
+# Test from network (replace IP)
+curl -s http://192.168.0.150:6680/health | jq .
+```
+
+### Common chat update scenarios
+
+#### Scenario 1: Function replacement
+Khi chat nói: "Replace function `funcName()` with this code:"
+
+```bash
+cd ~/youtube_music_api
+cp server.js server.js.backup.$(date +%Y%m%d_%H%M%S)
+
+nano server.js
+# Ctrl+W search "function funcName" hoặc "funcName ="
+# Delete entire function, paste new code
+# Save: Ctrl+X, Y, Enter
+
+node -c server.js && pm2 restart music-server
+```
+
+#### Scenario 2: Add new endpoint
+Khi chat nói: "Add this new endpoint after line X:"
+
+```bash
+nano server.js
+# Navigate to line X (Ctrl+_ then enter line number)
+# Or search for nearby function: Ctrl+W
+# Insert new code
+# Save
+
+node -c server.js && pm2 restart music-server
+```
+
+#### Scenario 3: Package.json updates
+Khi chat cung cấp new dependencies:
+
+```bash
+nano package.json
+# Add new packages to dependencies section
+# Save
+
+npm install
+pm2 restart music-server
+```
+
+#### Scenario 4: Multiple file changes
+```bash
+# Chat cung cấp changes cho nhiều files
+cd ~/youtube_music_api
+
+# Backup all
+for file in server.js package.json; do
+    [ -f "$file" ] && cp "$file" "$file.backup.$(date +%Y%m%d_%H%M%S)"
+done
+
+# Apply changes theo thứ tự chat cung cấp
+# Test each file syntax if possible
+node -c server.js  # for JS files
+
+# Install new deps if package.json changed
+[ -f package.json.backup.* ] && npm install
+
+pm2 restart music-server
+```
+
+### Quick recovery commands
+
+```bash
+# Rollback to last backup
+cd ~/youtube_music_api
+LAST_BACKUP=$(ls -t server.js.backup.* | head -n1)
+cp "$LAST_BACKUP" server.js
+pm2 restart music-server
+
+# Quick syntax fix
+nano server.js  # Fix the obvious syntax error
+pm2 restart music-server
+
+# Nuclear option: reset to GitHub
+git checkout -- .
+git pull origin master
+npm install
+pm2 restart music-server
+```
+
+### Real-time debugging với chat support
+
+```bash
+# Get current server status for chat analysis
+echo "=== Server Status ==="
+pm2 status
+
+echo "=== Recent Logs ==="
+pm2 logs music-server --lines 20
+
+echo "=== Health Check ==="
+curl -w "@{http_code}\n" http://localhost:6680/health
+
+echo "=== Process Info ==="
+ps aux | grep node
+
+echo "=== Memory Usage ==="
+free -h
+
+echo "=== Disk Space ==="
+df -h
+
+echo "=== Network ==="
+sudo netstat -tulpn | grep 6680
+```
+
+**Copy output này vào chat để được support debug!**
 
 ## Performance tips
 
@@ -409,57 +838,10 @@ pm2 start server.js --name music-server --max-memory-restart 200M
 
 ---
 
-✅ **Server sẵn sàng!** ESP32 /api/minizjp.com → http://PI_IP:6680 để sử dụng lyrics chất lượng cao.
+✅ **Server sẵn sàng!** ESP32 chỉ cần đổi server URL từ `/api/minizjp.com` → `http://PI_IP:6680` để sử dụng lyrics chất lượng cao và streaming ổn định.
 
-## Server endpoints
-
-- `GET /health` - Server health check
-- `GET /api/stream/mp3?url=YOUTUBE_URL` - Stream MP3 audio
-- `GET /api/lyric?id=VIDEO_ID&format=lrc` - Get lyrics in LRC format
-- `GET /stream_pcm?song=SONG_NAME&artist=ARTIST` - Compatible with ESP32
-
-## Troubleshooting
-
-### Port already in use
-```bash
-# Find process using port 6680
-sudo netstat -tulpn | grep 6680
-
-# Kill the process
-sudo kill -9 [PID]
+**Quick Commands cho ESP32:**
+```cpp
+// Trong xingzhi-cube-1.54tft-wifi.cc
+normalize_server_url("http://192.168.0.150:6680");  // Thay IP thực tế
 ```
-
-### Check logs
-```bash
-pm2 logs music-server --lines 100
-```
-
-### Restart server
-```bash
-pm2 restart music-server
-```
-
-### Update yt-dlp
-```bash
-sudo yt-dlp -U
-```
-
-### Memory issues on low-RAM Pi
-```bash
-# Limit Node.js memory
-export NODE_OPTIONS="--max-old-space-size=512"
-pm2 start server.js --name music-server --max-memory-restart 300M
-```
-
-## Performance tips
-
-- Use Pi 4/5 for better performance
-- Enable swap if RAM < 2GB
-- Use wired Ethernet for stable streaming
-- Keep yt-dlp updated for best compatibility
-
-## See also
-
-- `RASPBERRY_PI5_GUIDE.md` - Detailed Pi 5 setup guide
-- `API_REFERENCE.md` - Complete API documentation
-- `TROUBLESHOOTING.md` - Common issues and solutions
